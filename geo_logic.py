@@ -106,6 +106,112 @@ def _pick_diverse_locations(rows: list[dict], top_n: int) -> list[dict]:
     return picked[:top_n]
 
 
+# Bakı rayonları üzrə əlavə statistikalar (istifadəçi tərəfindən verilən məlumatlar)
+BAKU_DISTRICT_DENSITY = {
+    "nasimi": 21950.0,
+    "nizami": 9295.0,
+    "khatai": 9233.0,
+    "narimanov": 9060.0,
+    "yasamal": 9710.0,
+    "sabail": 3400.0,
+    "binagadi": 2374.0,
+    "surakhani": 1741.0,
+    "sabunchu": 1380.0,
+    "pirallahi": 627.0,
+    "khazar": 557.0,
+    "garadagh": 109.0,
+}
+
+BAKU_DISTRICT_SALARY = {
+    "binagadi": 944.0,
+    "khatai": 1265.3,
+    "khazar": 1603.3,
+    "garadagh": 1623.3,
+    "narimanov": 1130.6,
+    "nasimi": 1462.0,
+    "nizami": 1232.5,
+    "pirallahi": 2358.2,
+    "sabunchu": 999.7,
+    "sabail": 2028.8,
+    "surakhani": 917.5,
+    "yasamal": 1127.7,
+}
+
+BAKU_DISTRICT_EMPLOYED = {
+    "binagadi": 69184.0,
+    "khatai": 92818.0,
+    "khazar": 33106.0,
+    "garadagh": 24569.0,
+    "narimanov": 115737.0,
+    "nasimi": 226018.0,
+    "nizami": 62996.0,
+    "pirallahi": 7408.0,
+    "sabunchu": 38473.0,
+    "sabail": 117846.0,
+    "surakhani": 22110.0,
+    "yasamal": 170710.0,
+}
+
+DISTRICT_ALIASES = {
+    "nəsimi": "nasimi",
+    "насиминский": "nasimi",
+    "nasimi": "nasimi",
+    "nizami": "nizami",
+    "низаминский": "nizami",
+    "xətai": "khatai",
+    "xetai": "khatai",
+    "хатаинский": "khatai",
+    "khatai": "khatai",
+    "nərimanov": "narimanov",
+    "nərimanovski": "narimanov",
+    "narimanov": "narimanov",
+    "наримановский": "narimanov",
+    "yasamal": "yasamal",
+    "ясамальский": "yasamal",
+    "səbail": "sabail",
+    "sebail": "sabail",
+    "sabail": "sabail",
+    "сабаильский": "sabail",
+    "binəqədi": "binagadi",
+    "bineqedi": "binagadi",
+    "binagadi": "binagadi",
+    "бинагадинский": "binagadi",
+    "suraxanı": "surakhani",
+    "surakhani": "surakhani",
+    "сураханский": "surakhani",
+    "sabunçu": "sabunchu",
+    "sabuncu": "sabunchu",
+    "sabunchu": "sabunchu",
+    "сабунчинский": "sabunchu",
+    "pirallahı": "pirallahi",
+    "pirallahi": "pirallahi",
+    "пираллахинский": "pirallahi",
+    "xəzər": "khazar",
+    "xezer": "khazar",
+    "khazar": "khazar",
+    "хазарский": "khazar",
+    "qaradağ": "garadagh",
+    "qaradag": "garadagh",
+    "garadagh": "garadagh",
+    "гарадагский": "garadagh",
+}
+
+
+def _canonical_district_name(value: str) -> str:
+    raw = str(value or "").strip().lower()
+    if not raw:
+        return ""
+    cleaned = (
+        raw.replace(" district", "")
+        .replace(" rayonu", "")
+        .replace(" rayonu", "")
+        .replace(" район", "")
+        .replace("район", "")
+        .strip()
+    )
+    return DISTRICT_ALIASES.get(cleaned, cleaned)
+
+
 def _get_socio_economic_weight(city: str, state: str) -> float:
     """
     Yalnız Bakı və ətraf qəsəbələr (Abşeron daxil) üçün sıxlıq/gəlir indekslərinə 
@@ -113,10 +219,11 @@ def _get_socio_economic_weight(city: str, state: str) -> float:
     """
     c_norm = str(city).lower().strip()
     s_norm = str(state).lower().strip()
+    district_key = _canonical_district_name(s_norm)
     
     baku_aliases = {"baku", "baki", "bakı"}
-    high_income_baku = {"nasimi", "nəsimi", "sabail", "səbail", "sabayil", "yasamal", "narimanov", "nərimanov", "khatai", "xətai"}
-    mid_income_baku = {"binagadi", "binəqədi", "nizami"}
+    high_income_baku = {"nasimi", "sabail", "yasamal", "narimanov", "khatai"}
+    mid_income_baku = {"binagadi", "nizami"}
     
     # İstifadəçinin qeyd etdiyi Bakı ətrafı və Abşeron qəsəbələri
     baku_absheron_settlements = {
@@ -127,14 +234,30 @@ def _get_socio_economic_weight(city: str, state: str) -> float:
     
     weight = 1.0
     
+    if district_key in BAKU_DISTRICT_DENSITY:
+        # Sıxlıq + maaş + məşğulluq datasına əsaslanan dinamik çəki
+        density = BAKU_DISTRICT_DENSITY[district_key]
+        salary = BAKU_DISTRICT_SALARY.get(district_key, 1374.9)
+        employed = BAKU_DISTRICT_EMPLOYED.get(district_key, 980975.0 / 12.0)
+
+        density_norm = math.log1p(density) / math.log1p(max(BAKU_DISTRICT_DENSITY.values()))
+        salary_norm = salary / 1374.9  # Bakı şəhəri orta aylıq əməkhaqqı
+        employed_norm = math.log1p(employed) / math.log1p(max(BAKU_DISTRICT_EMPLOYED.values()))
+
+        # Maaş təsirini həddindən artıq etməmək üçün sərhədləyirik
+        salary_norm = min(max(salary_norm, 0.7), 1.6)
+
+        composite = (0.45 * density_norm) + (0.35 * salary_norm) + (0.20 * employed_norm)
+        return 0.85 + (0.95 * composite)
+
     if c_norm in baku_aliases or s_norm in baku_aliases:
         weight = 1.25 # Bakının ümumi baza çəkisi
         
         # Bakı mərkəz (Sıxlıq yüksək, Alıcılıq yüksək)
-        if s_norm in high_income_baku:
+        if district_key in high_income_baku or s_norm in high_income_baku:
             weight += 0.25 
         # Bakı orta mərkəz
-        elif s_norm in mid_income_baku:
+        elif district_key in mid_income_baku or s_norm in mid_income_baku:
             weight += 0.10
         # Şəhərkənarı bölgələr
         else:
