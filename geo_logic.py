@@ -66,6 +66,38 @@ def _display_street_name(value: str) -> str:
     return cleaned
 
 
+def _sample_nearest_points(
+    center_lat: float,
+    center_lon: float,
+    points_df: pd.DataFrame,
+    radius_km: float,
+    sample_size: int = 3,
+) -> list[dict]:
+    if points_df is None or points_df.empty:
+        return []
+
+    points = points_df[["lat", "lon"]].to_numpy(dtype=float)
+    distances = haversine_km(center_lat, center_lon, points[:, 0], points[:, 1])
+    within_mask = distances <= radius_km
+    if not np.any(within_mask):
+        return []
+
+    within_df = points_df.loc[within_mask].copy()
+    within_df["distance_km"] = distances[within_mask]
+    within_df = within_df.sort_values("distance_km").head(sample_size)
+
+    return [
+        {
+            "name": str(row.get("NAME") or "Bilinməyən"),
+            "type": str(row.get("TYPE") or ""),
+            "street": str(row.get("STRT_NAME_CLN") or ""),
+            "distance_km": round(float(row["distance_km"]), 3),
+            "maps_url": f"https://www.google.com/maps?q={float(row['lat']):.6f},{float(row['lon']):.6f}",
+        }
+        for _, row in within_df.iterrows()
+    ]
+
+
 def _pick_diverse_locations(rows: list[dict], top_n: int) -> list[dict]:
     picked = []
     used_streets: set[str] = set()
@@ -106,7 +138,7 @@ def _pick_diverse_locations(rows: list[dict], top_n: int) -> list[dict]:
     return picked[:top_n]
 
 
-# Bakı rayonları üzrə əlavə statistikalar (istifadəçi tərəfindən verilən məlumatlar)
+# Additional Baku district statistics (provided by the user)
 BAKU_DISTRICT_DENSITY = {
     "nasimi": 21950.0,
     "nizami": 9295.0,
@@ -212,10 +244,69 @@ def _canonical_district_name(value: str) -> str:
     return DISTRICT_ALIASES.get(cleaned, cleaned)
 
 
+def _market_snapshot(city: str, state: str, socio_weight: float) -> dict:
+    district_key = _canonical_district_name(state)
+
+    # Estimated ranges used for decision-support context.
+    rent_azn_m2_ranges = {
+        "nasimi": "18-35",
+        "sabail": "20-38",
+        "yasamal": "16-30",
+        "narimanov": "14-28",
+        "khatai": "13-26",
+        "nizami": "10-20",
+        "binagadi": "8-17",
+        "sabunchu": "7-15",
+        "surakhani": "7-14",
+        "khazar": "7-16",
+        "pirallahi": "5-11",
+        "garadagh": "5-10",
+    }
+
+    land_azn_m2_ranges = {
+        "nasimi": "1800-4000",
+        "sabail": "2200-4800",
+        "yasamal": "1500-3200",
+        "narimanov": "1300-3000",
+        "khatai": "1200-2800",
+        "nizami": "900-1900",
+        "binagadi": "750-1700",
+        "sabunchu": "650-1400",
+        "surakhani": "600-1300",
+        "khazar": "700-1600",
+        "pirallahi": "450-950",
+        "garadagh": "420-900",
+    }
+
+    avg_salary = BAKU_DISTRICT_SALARY.get(district_key, 1374.9)
+    avg_density = BAKU_DISTRICT_DENSITY.get(district_key, None)
+
+    if socio_weight >= 1.65:
+        purchasing_power = "yuksek"
+    elif socio_weight >= 1.35:
+        purchasing_power = "orta-yuksek"
+    elif socio_weight >= 1.15:
+        purchasing_power = "orta"
+    else:
+        purchasing_power = "asagi-orta"
+
+    return {
+        "district_key": district_key,
+        "estimated_land_price_azn_m2": land_azn_m2_ranges.get(district_key, "namelum"),
+        "estimated_rent_azn_m2_month": rent_azn_m2_ranges.get(district_key, "namelum"),
+        "avg_salary_azn": round(float(avg_salary), 1),
+        "population_density_km2": int(avg_density) if avg_density is not None else None,
+        "purchasing_power_level": purchasing_power,
+        "note": "teqribi intervaldir, son qerar ucun lokal bazar yoxlamasi vacibdir",
+        "city": str(city),
+        "state": str(state),
+    }
+
+
 def _get_socio_economic_weight(city: str, state: str) -> float:
     """
-    Yalnız Bakı və ətraf qəsəbələr (Abşeron daxil) üçün sıxlıq/gəlir indekslərinə 
-    əsasən hesablanmış regional weight multiplier.
+    Regional weight multiplier based on density/income indicators.
+    It is primarily calibrated for Baku and nearby settlements (including Absheron).
     """
     c_norm = str(city).lower().strip()
     s_norm = str(state).lower().strip()
@@ -225,7 +316,7 @@ def _get_socio_economic_weight(city: str, state: str) -> float:
     high_income_baku = {"nasimi", "sabail", "yasamal", "narimanov", "khatai"}
     mid_income_baku = {"binagadi", "nizami"}
     
-    # İstifadəçinin qeyd etdiyi Bakı ətrafı və Abşeron qəsəbələri
+    # Baku-adjacent and Absheron settlements provided in project scope
     baku_absheron_settlements = {
         "hokmali", "jeyranbatan", "khirdalan", "mahammadi", 
         "masazir", "mehdiabad", "novkhani", "novkhani (villas)", 
@@ -235,36 +326,36 @@ def _get_socio_economic_weight(city: str, state: str) -> float:
     weight = 1.0
     
     if district_key in BAKU_DISTRICT_DENSITY:
-        # Sıxlıq + maaş + məşğulluq datasına əsaslanan dinamik çəki
+        # Dynamic weight based on density + salary + employment data
         density = BAKU_DISTRICT_DENSITY[district_key]
         salary = BAKU_DISTRICT_SALARY.get(district_key, 1374.9)
         employed = BAKU_DISTRICT_EMPLOYED.get(district_key, 980975.0 / 12.0)
 
         density_norm = math.log1p(density) / math.log1p(max(BAKU_DISTRICT_DENSITY.values()))
-        salary_norm = salary / 1374.9  # Bakı şəhəri orta aylıq əməkhaqqı
+        salary_norm = salary / 1374.9  # Baku city average monthly salary
         employed_norm = math.log1p(employed) / math.log1p(max(BAKU_DISTRICT_EMPLOYED.values()))
 
-        # Maaş təsirini həddindən artıq etməmək üçün sərhədləyirik
+        # Clamp salary effect to avoid overweighting this signal
         salary_norm = min(max(salary_norm, 0.7), 1.6)
 
         composite = (0.45 * density_norm) + (0.35 * salary_norm) + (0.20 * employed_norm)
         return 0.85 + (0.95 * composite)
 
     if c_norm in baku_aliases or s_norm in baku_aliases:
-        weight = 1.25 # Bakının ümumi baza çəkisi
+        weight = 1.25 # Base uplift for Baku
         
-        # Bakı mərkəz (Sıxlıq yüksək, Alıcılıq yüksək)
+        # Central Baku (high density, stronger purchasing power)
         if district_key in high_income_baku or s_norm in high_income_baku:
             weight += 0.25 
-        # Bakı orta mərkəz
+        # Mid-tier Baku districts
         elif district_key in mid_income_baku or s_norm in mid_income_baku:
             weight += 0.10
-        # Şəhərkənarı bölgələr
+        # Outer urban areas
         else:
             weight -= 0.05
             
     elif c_norm in baku_absheron_settlements or s_norm in baku_absheron_settlements:
-        weight = 1.20 # Xırdalan, Masazır və digər qeyd edilən qəsəbələrin çəkisi
+        weight = 1.20 # Weight for Khirdalan, Masazir, and nearby settlements
     elif c_norm in {"sumgayit", "sumqayit", "sumgait", "sumqayıt"}:
         weight = 1.15
         
@@ -283,16 +374,16 @@ def run_logic_module(
 
     df = scoped_df.copy()
     
-    # Küçə adlarını təmizlə və boşluqları müəyyənləşdir
+    # Clean street names and normalize blanks
     df["STRT_NAME_CLN"] = df["STRT_NAME"].fillna("").astype(str).str.strip()
     df.loc[df["STRT_NAME_CLN"] == "", "STRT_NAME_CLN"] = "Bilinməyən Küçə"
     
-    # Koordinatları 3 rəqəmə qədər yuvarlaqlaşdırırıq (~110 metr kvadrat / grid)
-    # Bu bizə reallıqdan uzaq və ya sırf küçə adı eynidir deyə səhv hesablamaların qarşısını alır
+    # Round coordinates to 3 decimals (~110m grid cell)
+    # This prevents overly noisy or duplicate-like location candidates.
     df["lat_grid"] = df["lat"].round(3)
     df["lon_grid"] = df["lon"].round(3)
 
-    # Rayon və ya şəhər üçün ümumi sıxlıq indeksi
+    # Region-level density index by city/state group
     region_counts = df.groupby(["CITY", "STATE"], dropna=False).size()
     max_region_log = math.log1p(region_counts.max()) if not region_counts.empty else 1.0
     region_weights = {
@@ -310,8 +401,8 @@ def run_logic_module(
     rows = []
     target_type_label = ", ".join(target_types) if target_types else "UNKNOWN"
 
-    # Hər koordinat gridini sadəcə qruplaşdırıb hesablayırıq. 
-    # Bir gridin mütləq bir obyektdə dayanması şərt deyil.
+    # Evaluate each coordinate grid as a candidate location.
+    # A grid does not need to coincide with a single exact object point.
     for (city, state, lat_g, lon_g), block in grouped:
         center_lat = lat_g
         center_lon = lon_g
@@ -330,12 +421,21 @@ def run_logic_module(
             ]
             if target_bbox.empty:
                 competitors = 0
+                competitor_samples = []
             else:
                 target_coords = target_bbox[["lat", "lon"]].to_numpy(dtype=float)
                 comp_distances = haversine_km(center_lat, center_lon, target_coords[:, 0], target_coords[:, 1])
                 competitors = int((comp_distances <= radius_km).sum())
+                competitor_samples = _sample_nearest_points(
+                    center_lat,
+                    center_lon,
+                    target_bbox,
+                    radius_km,
+                    sample_size=3,
+                )
         else:
             competitors = 0
+            competitor_samples = []
 
         key_counts = {}
         key_samples = {}
@@ -360,7 +460,7 @@ def run_logic_module(
         region_w = region_weights.get((city, state), 1.0)
         socio_w = _get_socio_economic_weight(city, state)
 
-        # Qlobal xal = (Yerli dəstək xalı) * (Riyazi regional sıxlıq çəkisi (obyekt sayına görə)) * (Sosiokulturoloji və gəlir çəkisi)
+        # Global score = local support score * regional density weight * socio-economic weight
         base_score = (4.0 * support_density) + (2.5 * key_type_coverage) + (0.5 * demand_proxy) - (1.75 * competitors)
         score = base_score * region_w * socio_w
 
@@ -381,6 +481,8 @@ def run_logic_module(
                 "score": round(score, 3),
                 "key_breakdown": key_counts,
                 "nearby_examples": key_samples,
+                "nearby_competitors": competitor_samples,
+                "market_snapshot": _market_snapshot(city, state, socio_w),
                 "maps_url": gmaps_url,
             }
         )
